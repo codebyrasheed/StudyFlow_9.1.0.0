@@ -1,0 +1,161 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.8'
+          cache: true
+
+      - name: Generate Android project
+        run: |
+          cp lib/main.dart /tmp/main.dart
+          cp pubspec.yaml /tmp/pubspec.yaml
+          flutter create --platforms=android --project-name study_flow --org com.studyflow .
+          cp /tmp/main.dart lib/main.dart
+          cp /tmp/pubspec.yaml pubspec.yaml
+          sed -i 's/android:label="[^"]*"/android:label="StudyFlow"/' android/app/src/main/AndroidManifest.xml
+          sed -i 's/version "2.4.0" apply false/version "2.3.20" apply false/' android/settings.gradle.kts
+
+      - name: Repair and verify required Android NDK
+        shell: bash
+        env:
+          REQUIRED_NDK_VERSION: '28.2.13676358'
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export ANDROID_HOME="$SDK_ROOT"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::Android sdkmanager was not found under $SDK_ROOT/cmdline-tools"
+            exit 1
+          fi
+
+          NDK_DIR="$SDK_ROOT/ndk/$REQUIRED_NDK_VERSION"
+          echo "Using SDK Manager: $SDKMANAGER"
+          echo "Required NDK: $REQUIRED_NDK_VERSION"
+
+          # Remove only the requested NDK package. Leave all other SDK
+          # platforms, build-tools, NDK revisions, and Gradle caches intact.
+          rm -rf "$NDK_DIR"
+
+          # Remove only temporary SDK Manager entries identifiable as this
+          # NDK package; do not clear the shared .temp directory.
+          if [ -d "$SDK_ROOT/.temp" ]; then
+            find "$SDK_ROOT/.temp" -maxdepth 1 -type f \
+              \( -iname "*ndk*${REQUIRED_NDK_VERSION}*" -o -iname "*${REQUIRED_NDK_VERSION}*ndk*" \) \
+              -delete
+          fi
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
+
+          installed=false
+          for attempt in 1 2 3; do
+            echo "NDK installation attempt $attempt/3"
+            if "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "ndk;$REQUIRED_NDK_VERSION"; then
+              if [ -f "$NDK_DIR/source.properties" ] && \
+                 grep -Fq "Pkg.Revision = $REQUIRED_NDK_VERSION" "$NDK_DIR/source.properties" && \
+                 [ -x "$NDK_DIR/ndk-build" ] && [ -d "$NDK_DIR/toolchains/llvm" ]; then
+                installed=true
+                break
+              fi
+              echo "::warning::NDK package metadata or toolchain validation failed."
+            else
+              echo "::warning::SDK Manager failed to install the requested NDK."
+            fi
+
+            # Clear only a failed partial copy before retrying the same version.
+            rm -rf "$NDK_DIR"
+          done
+
+          if [ "$installed" != true ]; then
+            echo "::error::NDK $REQUIRED_NDK_VERSION could not be installed and verified."
+            exit 1
+          fi
+
+          echo "Verified NDK revision:"
+          grep -F "Pkg.Revision" "$NDK_DIR/source.properties"
+          test -x "$NDK_DIR/ndk-build"
+          test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+
+      - name: Configure Android for notifications
+        run: |
+          python3 - <<'PYEOF'
+          m = 'android/app/src/main/AndroidManifest.xml'
+          s = open(m, encoding='utf-8').read()
+          names = ['POST_NOTIFICATIONS', 'RECEIVE_BOOT_COMPLETED', 'VIBRATE', 'SCHEDULE_EXACT_ALARM', 'USE_EXACT_ALARM']
+          perms = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % n for n in names)
+          if 'POST_NOTIFICATIONS' not in s:
+              s = s.replace('<application', perms + '    <application', 1)
+          recv = (
+              '        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />\n'
+              '        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">\n'
+              '            <intent-filter>\n'
+              '                <action android:name="android.intent.action.BOOT_COMPLETED"/>\n'
+              '                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>\n'
+              '                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>\n'
+              '                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>\n'
+              '            </intent-filter>\n'
+              '        </receiver>\n'
+          )
+          if 'ScheduledNotificationReceiver' not in s:
+              s = s.replace('</application>', recv + '    </application>', 1)
+          web = (
+              '        <intent><action android:name="android.intent.action.VIEW"/><data android:scheme="https"/></intent>\n'
+              '        <intent><action android:name="android.intent.action.VIEW"/><data android:scheme="http"/></intent>\n'
+          )
+          if 'android:scheme="https"' not in s:
+              if '</queries>' in s:
+                  s = s.replace('</queries>', web + '    </queries>', 1)
+              else:
+                  s = s.replace('<application', '    <queries>\n' + web + '    </queries>\n    <application', 1)
+          storage = (
+              '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n'
+              '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n'
+              '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>\n'
+          )
+          if 'MANAGE_EXTERNAL_STORAGE' not in s:
+              s = s.replace('<application', storage + '    <application', 1)
+          if 'requestLegacyExternalStorage' not in s:
+              s = s.replace('<application ', '<application android:requestLegacyExternalStorage="true" ', 1)
+          open(m, 'w', encoding='utf-8').write(s)
+
+          g = 'android/app/build.gradle.kts'
+          t = open(g, encoding='utf-8').read()
+          if 'isCoreLibraryDesugaringEnabled' not in t:
+              assert 'compileOptions {' in t, 'compileOptions block not found'
+              t = t.replace('compileOptions {', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', 1)
+              t += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n}\n'
+          open(g, 'w', encoding='utf-8').write(t)
+          print(open(m, encoding='utf-8').read())
+          PYEOF
+
+      - run: flutter config --enable-native-assets || true
+      - run: flutter pub get
+      - run: flutter analyze lib --no-fatal-infos --no-fatal-warnings
+      - run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StudyFlow-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
